@@ -1,0 +1,15 @@
+services:
+  yueji:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      YUEJI_MASTER_KEY: ${YUEJI_MASTER_KEY:?请在 .env 或 shell 中设置 Fernet 主密钥}
+      YUEJI_ALLOWED_API_HOSTS: ${YUEJI_ALLOWED_API_HOSTS:-api.deepseek.com,api.openai.com,api.moonshot.cn,api.groq.com,openrouter.ai,api.together.xyz}
+      YUEJI_SESSION_TTL_DAYS: ${YUEJI_SESSION_TTL_DAYS:-7}
+    volumes:
+      - yueji-data:/app/data
+    restart: unless-stopped
+
+volumes:
+  yueji-data:

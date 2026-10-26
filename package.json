@@ -1,0 +1,21 @@
+{
+  "name": "yueji-reading-room",
+  "version": "0.1.0",
+  "private": true,
+  "description": "阅迹：本地优先的纸质书阅读手账（阶段 0/1）",
+  "scripts": {
+    "dev": "node scripts/dev.mjs",
+    "dev:backend": "node scripts/dev.mjs --backend-only",
+    "dev:frontend": "node scripts/dev.mjs --frontend-only",
+    "build": "node scripts/frontend.mjs build",
+    "test": "node scripts/test-all.mjs",
+    "test:backend": "node scripts/python.mjs -m pytest backend/tests -q",
+    "test:frontend": "node scripts/frontend.mjs test",
+    "test:e2e": "node scripts/e2e-with-servers.mjs",
+    "auth:invite": "node scripts/backend-python.mjs -m app.auth_cli invite --label \"同学试用\"",
+    "auth:create-user": "node scripts/backend-python.mjs -m app.auth_cli create-user"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.51.0"
+  }
+}
