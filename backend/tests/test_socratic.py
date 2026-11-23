@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 import json
+import threading
 from typing import Any
 
 import pytest
@@ -245,6 +247,26 @@ def test_socratic_start_is_idempotent_per_client_request_id(socratic_setup):
     mismatch = client.post("/api/socratic/start", json={"book_id": book["id"], "rounds": 4, "client_request_id": "socratic-req-1"})
     assert mismatch.status_code == 409
     assert client.get("/api/socratic").json()["items"] and len(client.get("/api/socratic").json()["items"]) == 1
+
+
+def test_socratic_start_concurrent_retry_returns_original_not_500(socratic_setup, monkeypatch):
+    from app import socratic
+
+    client, book, _, _ = socratic_setup
+    barrier = threading.Barrier(2)
+    original_snapshot = socratic._snapshot
+
+    def synchronized_snapshot(*args):
+        barrier.wait(timeout=10)
+        return original_snapshot(*args)
+
+    monkeypatch.setattr(socratic, "_snapshot", synchronized_snapshot)
+    payload = {"book_id": book["id"], "rounds": 3, "client_request_id": "socratic-concurrent-retry"}
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        responses = list(pool.map(lambda _: client.post("/api/socratic/start", json=payload), range(2)))
+    assert [response.status_code for response in responses] == [201, 201]
+    assert responses[0].json()["id"] == responses[1].json()["id"]
+    assert len(client.get("/api/socratic").json()["items"]) == 1
 
 
 def test_socratic_early_finish_generates_report(socratic_setup, monkeypatch):
