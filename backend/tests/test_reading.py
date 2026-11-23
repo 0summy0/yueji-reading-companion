@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
+import threading
 
 from app.db import connect
 from conftest import import_txt
@@ -81,6 +83,52 @@ def test_session_idempotency_is_scoped_and_validated(client):
     assert client.post(f"/api/books/{other['id']}/sessions", json=other_payload).status_code == 409
 
 
+def test_session_concurrent_retry_returns_original_not_500(client, monkeypatch):
+    from app import reading
+
+    book, items = setup_book(client)
+    payload = session_payload(items, request_id="session-concurrent-retry")
+    barrier = threading.Barrier(2)
+    original_passage = reading._passage
+
+    def synchronized_passage(*args):
+        barrier.wait(timeout=10)
+        return original_passage(*args)
+
+    monkeypatch.setattr(reading, "_passage", synchronized_passage)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        responses = list(pool.map(
+            lambda _: client.post(f"/api/books/{book['id']}/sessions", json=payload),
+            range(2),
+        ))
+    assert [response.status_code for response in responses] == [201, 201]
+    assert responses[0].json()["id"] == responses[1].json()["id"]
+    assert len(client.get(f"/api/books/{book['id']}/sessions").json()["items"]) == 1
+
+
+def test_note_concurrent_retry_returns_original_not_500(client, monkeypatch):
+    from app import reading
+
+    book, items = setup_book(client)
+    payload = {
+        "book_id": book["id"], "passage_id": items[1]["id"], "text": "并发重试的笔记。",
+        "client_request_id": "note-concurrent-retry",
+    }
+    barrier = threading.Barrier(2)
+    original_passage = reading._passage
+
+    def synchronized_passage(*args):
+        barrier.wait(timeout=10)
+        return original_passage(*args)
+
+    monkeypatch.setattr(reading, "_passage", synchronized_passage)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        responses = list(pool.map(lambda _: client.post("/api/notes", json=payload), range(2)))
+    assert [response.status_code for response in responses] == [201, 201]
+    assert responses[0].json()["id"] == responses[1].json()["id"]
+    assert len(client.get(f"/api/books/{book['id']}/notes").json()["items"]) == 1
+
+
 def test_note_versions_evidence_stale_cards_and_idempotency(client):
     book, items = setup_book(client)
     payload = {"book_id": book["id"], "passage_id": items[1]["id"], "text": "我最初的疑问。", "client_request_id": "note-retry"}
@@ -148,6 +196,34 @@ def test_reading_context_optional_idempotent_and_returned(client):
 
     session_events = client.get("/api/timeline").json()["items"]
     assert any(item["kind"] == "session" and item["data"].get("reading_context") for item in session_events)
+
+
+def test_timeline_uses_constant_batch_queries_per_book(client):
+    from app import reading
+
+    book, items = setup_book(client)
+    for index in range(3):
+        response = client.post(
+            f"/api/books/{book['id']}/sessions",
+            json=session_payload(items, request_id=f"timeline-session-{index}"),
+        )
+        assert response.status_code == 201
+        note = client.post("/api/notes", json={
+            "book_id": book["id"], "passage_id": items[1]["id"],
+            "text": f"批量时间线笔记 {index}", "client_request_id": f"timeline-note-{index}",
+        })
+        assert note.status_code == 201
+
+    with connect(client.app.state.settings) as conn:
+        statements: list[str] = []
+        conn.set_trace_callback(statements.append)
+        events = reading.timeline(conn)
+        conn.set_trace_callback(None)
+    selects = [sql for sql in statements if sql.lstrip().upper().startswith("SELECT")]
+    assert len(events) == 6
+    assert len(selects) <= 8, "时间线查询数不应随会话或笔记条数增长"
+    note_event = next(item for item in events if item["kind"] == "note")
+    assert "note_version_id" not in note_event["data"]["evidence"]
 
 
 def test_002_migration_upgrades_existing_database(tmp_path, monkeypatch):

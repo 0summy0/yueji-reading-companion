@@ -1,5 +1,31 @@
 # 测试报告
 
+## 0.7.0 并发、性能与工程化加固（2026-11-23）
+
+| 项 | 实际结果 |
+|---|---|
+| 阅读会话、笔记、书格拉底并发重试返回原结果，不产生重复记录或 500 | PASS |
+| 时间线批量查询，3 会话 + 3 笔记场景 SELECT 数不超过 8 | PASS |
+| 共享 SQLite 限流：8 并发限 4 仅成功 4，新限流器实例仍共享额度 | PASS |
+| 可信代理解析 XFF；未信任代理继续忽略伪造 XFF | PASS |
+| 非预期照片异常标记 failed、清除本地路径并删除文件 | PASS |
+| 后端全量 pytest | **113 passed, 3 warnings** |
+| 前端 Vitest | **21 passed** |
+| TypeScript 与前端生产构建 | PASS；最大 JS chunk 223.22 kB，无 500 kB 警告 |
+| `pip check` / 锁定依赖 dry-run | PASS |
+| 真实书页 OCR 标注集、真实服务商对比 | NOT RUN（需要用户实拍样本与服务商凭据） |
+
+## 0.6.5 迁移与云照片安全加固（2026-11-23）
+
+| 项 | 实际结果 |
+|---|---|
+| 迁移中途失败，表结构与版本记录整体回滚；修复后重试成功 | PASS |
+| 云照片 URL 协议、端口、用户信息、片段、直接 IP 与非公网 DNS 校验 | PASS |
+| `Content-Length` 与流式实际累计字节双重体积限制 | PASS |
+| 后端全量 pytest | **106 passed, 3 warnings** |
+| 前端 Vitest | **21 passed** |
+| TypeScript 与前端生产构建 | PASS（Vite 保留单个 chunk 超 500 kB 提示） |
+
 ## 0.6.1 DeepSeek V4.1 Flash 视觉兼容增量（2026-10-26）
 
 | 项 | 实际结果 |
