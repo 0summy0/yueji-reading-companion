@@ -2,11 +2,14 @@ from __future__ import annotations
 
 from difflib import SequenceMatcher
 import io
+import ipaddress
 import json
 from pathlib import Path
 import re
+import socket
 import sqlite3
 from typing import Any
+from urllib.parse import urlparse
 
 from fastapi import HTTPException
 import httpx
@@ -124,21 +127,86 @@ def _candidates(passages: list[dict[str, Any]], lines: list[str]) -> list[dict[s
     return scored[:3]
 
 
-def fetch_signed_photo(url: str) -> bytes:
-    """从用户云存储签名 URL 下载照片字节；仅接受 HTTPS，禁止跟随重定向，限制体积。"""
-    if not url.startswith("https://"):
-        raise HTTPException(400, "照片地址必须为 HTTPS 签名链接")
+def _validate_signed_photo_url(url: str) -> str:
+    """签名 URL 可以指向任意云存储服务商，但目标必须是公网 HTTPS 地址。"""
     try:
-        with httpx.Client(timeout=25, follow_redirects=False) as client:
-            response = client.get(url)
+        parsed = urlparse(url.strip())
+        port = parsed.port
+    except ValueError as exc:
+        raise HTTPException(400, "照片签名链接格式无效") from exc
+    if parsed.scheme.lower() != "https":
+        raise HTTPException(400, "照片地址必须为 HTTPS 签名链接")
+    if parsed.username or parsed.password or parsed.fragment:
+        raise HTTPException(400, "照片签名链接不允许包含用户信息或片段")
+    if port not in (None, 443):
+        raise HTTPException(400, "照片签名链接必须使用 443 端口")
+    hostname = (parsed.hostname or "").lower().rstrip(".")
+    if not hostname:
+        raise HTTPException(400, "照片签名链接缺少主机名")
+    try:
+        ipaddress.ip_address(hostname)
+    except ValueError:
+        pass
+    else:
+        raise HTTPException(400, "照片签名链接必须使用服务域名，不能直接填写 IP")
+    try:
+        infos = socket.getaddrinfo(hostname, 443, type=socket.SOCK_STREAM)
+    except OSError as exc:
+        raise HTTPException(400, "照片服务域名解析失败，请重新上传后再试") from exc
+    if not infos:
+        raise HTTPException(400, "照片服务域名解析失败，请重新上传后再试")
+    for info in infos:
+        try:
+            address = ipaddress.ip_address(info[4][0])
+        except ValueError as exc:
+            raise HTTPException(400, "照片服务域名解析结果无效") from exc
+        if not address.is_global:
+            raise HTTPException(400, "照片签名链接解析到非公网地址，已拒绝")
+    return parsed.geturl()
+
+
+def fetch_signed_photo(url: str, transport: httpx.BaseTransport | None = None) -> bytes:
+    """从公网云存储签名 URL 流式下载照片；禁止重定向，并限制声明与实际体积。"""
+    safe_url = _validate_signed_photo_url(url)
+    try:
+        with httpx.Client(timeout=25, follow_redirects=False, transport=transport) as client:
+            with client.stream("GET", safe_url) as response:
+                if response.is_redirect:
+                    raise HTTPException(400, "照片签名链接不允许重定向，请重新上传后再试")
+                if response.status_code != 200:
+                    raise HTTPException(400, "照片签名链接已失效，请重新上传后再试")
+                length = response.headers.get("content-length")
+                if length:
+                    try:
+                        declared_size = int(length)
+                    except ValueError as exc:
+                        raise HTTPException(400, "照片服务响应长度头无效") from exc
+                    if declared_size < 0 or declared_size > MAX_PHOTO_BYTES:
+                        raise HTTPException(413, "照片超过 12 MiB 限制")
+                chunks: list[bytes] = []
+                total = 0
+                for chunk in response.iter_bytes():
+                    total += len(chunk)
+                    if total > MAX_PHOTO_BYTES:
+                        raise HTTPException(413, "照片超过 12 MiB 限制")
+                    chunks.append(chunk)
+                return b"".join(chunks)
+    except HTTPException:
+        raise
     except httpx.TransportError as exc:
         raise HTTPException(400, "照片下载失败，请重新上传后再试") from exc
-    if response.status_code != 200:
-        raise HTTPException(400, "照片签名链接已失效，请重新上传后再试")
-    data = response.content
-    if len(data) > MAX_PHOTO_BYTES:
-        raise HTTPException(413, "照片超过 12 MiB 限制")
-    return data
+
+
+def _discard_local_attempt_photo(conn: sqlite3.Connection, photo_id: str, local_path: str | None) -> None:
+    """识别未成功时不再保留无用途的本地照片；云端对象仍由前端云存储管理。"""
+    if not local_path:
+        return
+    try:
+        Path(local_path).unlink(missing_ok=True)
+    except OSError:
+        return
+    with conn:
+        conn.execute("UPDATE photos SET local_path = NULL WHERE id = ?", (photo_id,))
 
 
 def create_location_attempt(
@@ -209,7 +277,17 @@ def create_location_attempt(
                 "UPDATE location_attempts SET ocr_text = ?, candidate_json = '[]', confidence = NULL, state = 'failed' WHERE id = ?",
                 (f"识别失败：{error.safe_message}"[:1000], attempt_id),
             )
+        _discard_local_attempt_photo(conn, photo_id, local_path)
         return {"attempt": {"id": attempt_id, "photo_id": photo_id, "state": "failed", "ocr_text": "", "candidates": [], "message": f"识别失败：{error.safe_message}。可使用手动定位。", "task_route": task, "cloud_path": cloud_path}}
+    except Exception:
+        # 配置错误、适配器异常等也不能让记录永远停在 pending，或遗留无用途的敏感照片。
+        with conn:
+            conn.execute(
+                "UPDATE location_attempts SET ocr_text = ?, candidate_json = '[]', confidence = NULL, state = 'failed' WHERE id = ?",
+                ("识别失败：服务暂时不可用", attempt_id),
+            )
+        _discard_local_attempt_photo(conn, photo_id, local_path)
+        raise
 
 
 def confirm_location_attempt(conn: sqlite3.Connection, attempt_id: str, payload: LocationConfirm) -> dict[str, Any]:
