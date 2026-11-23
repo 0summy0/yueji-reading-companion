@@ -25,7 +25,19 @@ jobs:
       - name: Install locked dependencies
         run: pip install -r backend/requirements-lock.txt
       - name: Run backend tests
-        run: python -m pytest backend/tests -q
+        shell: bash
+        run: |
+          set -o pipefail
+          python -m pytest backend/tests -q 2>&1 | tee backend-test.log
+          status=${PIPESTATUS[0]}
+          if [ "$status" -ne 0 ]; then
+            {
+              printf '### Backend test output\n\n```text\n'
+              cat backend-test.log
+              printf '\n```\n'
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit "$status"
+          fi
 
   frontend:
     runs-on: ubuntu-latest
