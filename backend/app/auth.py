@@ -4,6 +4,7 @@ from collections import defaultdict, deque
 from datetime import datetime, timedelta, timezone
 import hashlib
 import hmac
+import ipaddress
 import re
 import secrets
 import sqlite3
@@ -49,6 +50,14 @@ CREATE TABLE IF NOT EXISTS auth_sessions (
     revoked_at TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_auth_sessions_user ON auth_sessions(user_id, expires_at);
+CREATE TABLE IF NOT EXISTS auth_rate_limits (
+    key TEXT PRIMARY KEY,
+    window_start INTEGER NOT NULL,
+    window_seconds INTEGER NOT NULL,
+    hits INTEGER NOT NULL,
+    expires_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_auth_rate_limits_expiry ON auth_rate_limits(expires_at);
 """
 
 
@@ -57,7 +66,32 @@ class RateLimiter:
         self._lock = threading.Lock()
         self._hits: dict[str, deque[float]] = defaultdict(deque)
 
-    def check(self, key: str, limit: int, window_seconds: int) -> None:
+    def check(self, key: str, limit: int, window_seconds: int, settings: Settings | None = None) -> None:
+        if settings is None:
+            # 保留无数据库的轻量用法；应用请求均应传入 settings 使用共享持久化限流。
+            self._check_memory(key, limit, window_seconds)
+            return
+        now = datetime.now(timezone.utc).timestamp()
+        bucket = int(now // window_seconds) * window_seconds
+        expires_at = bucket + window_seconds
+        with _auth_db(settings) as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute("SELECT * FROM auth_rate_limits WHERE key = ?", (key,)).fetchone()
+            if row and row["window_start"] == bucket and row["window_seconds"] == window_seconds:
+                if row["hits"] >= limit:
+                    raise HTTPException(429, "操作过于频繁，请稍后再试")
+                conn.execute("UPDATE auth_rate_limits SET hits = hits + 1 WHERE key = ?", (key,))
+            else:
+                conn.execute(
+                    """INSERT INTO auth_rate_limits(key, window_start, window_seconds, hits, expires_at)
+                       VALUES (?, ?, ?, 1, ?)
+                       ON CONFLICT(key) DO UPDATE SET window_start = excluded.window_start,
+                           window_seconds = excluded.window_seconds, hits = 1, expires_at = excluded.expires_at""",
+                    (key, bucket, window_seconds, expires_at),
+                )
+            conn.execute("DELETE FROM auth_rate_limits WHERE expires_at <= ?", (int(now),))
+
+    def _check_memory(self, key: str, limit: int, window_seconds: int) -> None:
         now = datetime.now(timezone.utc).timestamp()
         with self._lock:
             hits = self._hits[key]
@@ -266,9 +300,29 @@ def validate_origin(request: Request) -> None:
         raise HTTPException(403, "跨站请求被拒绝") from exc
 
 
+def _trusted_proxy(peer: str, settings: Settings) -> bool:
+    for configured in settings.trusted_proxy_ips:
+        if peer == configured:
+            return True
+        try:
+            if ipaddress.ip_address(peer) in ipaddress.ip_network(configured, strict=False):
+                return True
+        except ValueError:
+            continue
+    return False
+
+
 def client_key(request: Request, scope: str) -> str:
-    # 不无条件信任客户端可伪造的 X-Forwarded-For；同一反代后的同学按 client/IP 分桶。
-    ip = request.client.host if request.client else "local"
+    # 只信任显式配置代理传来的 XFF；默认仍使用直连 peer，避免客户端伪造来源绕过限流。
+    settings: Settings = request.app.state.settings
+    peer = request.client.host if request.client else "local"
+    ip = peer
+    if _trusted_proxy(peer, settings):
+        forwarded = request.headers.get("x-forwarded-for", "").split(",", 1)[0].strip()
+        try:
+            ip = str(ipaddress.ip_address(forwarded))
+        except ValueError:
+            pass
     return f"{scope}:{ip}"
 
 
@@ -339,7 +393,7 @@ def auth_me(request: Request) -> dict[str, Any]:
 def auth_register(request: Request, payload: dict[str, str]) -> JSONResponse:
     settings: Settings = request.app.state.settings
     validate_origin(request)
-    rate_limiter.check(client_key(request, "register"), 8, 600)
+    rate_limiter.check(client_key(request, "register"), 8, 600, settings=settings)
     user = register_user(settings, payload["invite_code"], payload["username"], payload["password"])
     token, _ = create_session(settings, user["id"])
     response = JSONResponse({"user": user}, status_code=201)
@@ -350,7 +404,7 @@ def auth_register(request: Request, payload: dict[str, str]) -> JSONResponse:
 def auth_login(request: Request, payload: dict[str, str]) -> JSONResponse:
     settings: Settings = request.app.state.settings
     validate_origin(request)
-    rate_limiter.check(client_key(request, "login"), 10, 600)
+    rate_limiter.check(client_key(request, "login"), 10, 600, settings=settings)
     with _auth_db(settings) as conn:
         user = conn.execute("SELECT * FROM auth_users WHERE username = ? AND disabled = 0", (payload["username"].strip(),)).fetchone()
     if not user or not _verify_password(payload["password"], user["password_hash"]):
