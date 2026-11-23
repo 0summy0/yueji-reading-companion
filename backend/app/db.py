@@ -33,15 +33,29 @@ def migrate(conn: sqlite3.Connection) -> None:
     conn.execute(
         "CREATE TABLE IF NOT EXISTS schema_migrations (version INTEGER PRIMARY KEY, name TEXT NOT NULL, applied_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)"
     )
+    conn.commit()
     applied = {row[0] for row in conn.execute("SELECT version FROM schema_migrations")}
     for path in sorted(MIGRATIONS_DIR.glob("[0-9][0-9][0-9]_*.sql")):
         version = int(path.name[:3])
         if version in applied:
             continue
         sql = path.read_text(encoding="utf-8")
-        conn.executescript(sql)
-        conn.execute("INSERT INTO schema_migrations(version, name) VALUES (?, ?)", (version, path.name))
-        conn.commit()
+        try:
+            # executescript 会先提交既有事务，因此在脚本内部显式开启事务；
+            # 版本记录也在同一事务中提交，失败时不会留下半套表结构。
+            conn.executescript(f"BEGIN IMMEDIATE;\n{sql}")
+            conn.execute("INSERT INTO schema_migrations(version, name) VALUES (?, ?)", (version, path.name))
+            conn.commit()
+            applied.add(version)
+        except Exception:
+            conn.rollback()
+            # 另一进程可能在本进程等待写锁期间完成了同一迁移。
+            already_applied = conn.execute(
+                "SELECT 1 FROM schema_migrations WHERE version = ?", (version,)
+            ).fetchone()
+            if not already_applied:
+                raise
+            applied.add(version)
 
 
 # sqlite3.Connection 的 with 只管理事务、不关闭连接；进程内缓存避免每个请求都重复扫描迁移目录。

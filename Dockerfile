@@ -1,7 +1,7 @@
 FROM node:22-alpine AS frontend
 WORKDIR /app/frontend
-COPY frontend/package.json frontend/package-lock.json* ./
-RUN npm install
+COPY frontend/package.json frontend/pnpm-lock.yaml ./
+RUN corepack enable && pnpm install --frozen-lockfile
 COPY frontend/ ./
 RUN npm run build
 
@@ -13,8 +13,8 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends fonts-noto-cjk \
     && rm -rf /var/lib/apt/lists/*
 WORKDIR /app/backend
-COPY backend/requirements.txt ./requirements.txt
-RUN pip install --no-cache-dir -r requirements.txt
+COPY backend/requirements-lock.txt ./requirements-lock.txt
+RUN pip install --no-cache-dir -r requirements-lock.txt
 COPY backend ./backend
 COPY samples /app/samples
 COPY --from=frontend /app/frontend/dist /app/frontend/dist

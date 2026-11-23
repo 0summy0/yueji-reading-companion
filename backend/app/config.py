@@ -56,6 +56,7 @@ class Settings:
     test_invite_code: str | None
     bootstrap_invite_code: str | None
     public_origins: tuple[str, ...]
+    trusted_proxy_ips: tuple[str, ...]
 
     @property
     def is_production(self) -> bool:
@@ -102,4 +103,7 @@ def get_settings() -> Settings:
         allowed_api_hosts=hosts,
         test_invite_code=test_invite,
         bootstrap_invite_code=os.getenv("YUEJI_BOOTSTRAP_INVITE_CODE"),
+        trusted_proxy_ips=tuple(
+            item.strip() for item in os.getenv("YUEJI_TRUSTED_PROXY_IPS", "").split(",") if item.strip()
+        ),
     )

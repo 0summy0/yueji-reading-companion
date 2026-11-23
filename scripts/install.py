@@ -36,7 +36,7 @@ def main() -> None:
     elif corepack:
         package_manager = [corepack, "pnpm"]
     else:
-        raise SystemExit("未找到 pnpm/npm/corepack。可将 WORK_ENVIRONMENT.md 中的 pnpm 路径放入 PNPM 环境变量后重试。")
+        raise SystemExit("未找到 pnpm/npm/corepack。请安装 pnpm，或将 pnpm 可执行文件路径放入 PNPM 环境变量后重试。")
     run([*package_manager, "install"])
     run([*package_manager, "install"], ROOT / "frontend")
     print("\n安装完成。运行 npm run dev（或 pnpm dev），然后打开 http://127.0.0.1:5173")

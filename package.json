@@ -1,8 +1,8 @@
 {
   "name": "yueji-reading-room",
-  "version": "0.1.0",
+  "version": "0.7.0",
   "private": true,
-  "description": "阅迹：本地优先的纸质书阅读手账（阶段 0/1）",
+  "description": "阅迹：本地优先的纸质书 AI 阅读伴侣",
   "scripts": {
     "dev": "node scripts/dev.mjs",
     "dev:backend": "node scripts/dev.mjs --backend-only",
