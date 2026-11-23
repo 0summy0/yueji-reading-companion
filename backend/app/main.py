@@ -39,7 +39,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="阅迹 API",
-    version="0.2.0",
+    version="0.7.0",
     description="真实 BYOK、证据式问答、照片确认与邀请制试用版。",
     lifespan=lifespan,
 )
@@ -193,7 +193,7 @@ async def attach_context_photo(
     conn: sqlite3.Connection = Depends(get_db),
 ):
     user = auth.current_user(request)
-    auth.rate_limiter.check(f"context-photo:{user['id'] if user else 'local'}", 20, 60)
+    auth.rate_limiter.check(f"context-photo:{user['id'] if user else 'local'}", 20, 60, settings=request.app.state.settings)
     if file is not None:
         data = await file.read(photos.MAX_PHOTO_BYTES + 1)
     elif photo_url:
@@ -250,7 +250,7 @@ def create_location_attempt(
 ):
     settings: Settings = request.app.state.settings
     user = auth.current_user(request)
-    auth.rate_limiter.check(f"photo:{user['id'] if user else 'local'}", 20, 60)
+    auth.rate_limiter.check(f"photo:{user['id'] if user else 'local'}", 20, 60, settings=request.app.state.settings)
     if file is not None:
         data = file.file.read(photos.MAX_PHOTO_BYTES + 1)
     elif photo_url:
@@ -269,7 +269,7 @@ def confirm_location_attempt(attempt_id: str, payload: LocationConfirm, conn: sq
 def ask(request: Request, payload: AskRequest, conn: sqlite3.Connection = Depends(get_db)):
     settings: Settings = request.app.state.settings
     user = auth.current_user(request)
-    auth.rate_limiter.check(f"ask:{user['id'] if user else 'local'}", 20, 60)
+    auth.rate_limiter.check(f"ask:{user['id'] if user else 'local'}", 20, 60, settings=request.app.state.settings)
     return asking.ask(conn, settings, payload)
 
 
@@ -277,7 +277,7 @@ def ask(request: Request, payload: AskRequest, conn: sqlite3.Connection = Depend
 def evidence(request: Request, payload: AskRequest, conn: sqlite3.Connection = Depends(get_db)):
     """只返回当前用户已读证据包，供前端免密钥云端问答自行组织提示词；不做模型调用。"""
     user = auth.current_user(request)
-    auth.rate_limiter.check(f"evidence:{user['id'] if user else 'local'}", 30, 60)
+    auth.rate_limiter.check(f"evidence:{user['id'] if user else 'local'}", 30, 60, settings=request.app.state.settings)
     items = asking.evidence_package(conn, payload)
     compact = [
         {
@@ -295,7 +295,7 @@ def evidence(request: Request, payload: AskRequest, conn: sqlite3.Connection = D
 def socratic_start(request: Request, payload: SocraticStart, conn: sqlite3.Connection = Depends(get_db)):
     settings: Settings = request.app.state.settings
     user = auth.current_user(request)
-    auth.rate_limiter.check(f"socratic:{user['id'] if user else 'local'}", 12, 60)
+    auth.rate_limiter.check(f"socratic:{user['id'] if user else 'local'}", 12, 60, settings=request.app.state.settings)
     return socratic.start(conn, settings, payload)
 
 
@@ -312,7 +312,7 @@ def socratic_detail(session_id: str, conn: sqlite3.Connection = Depends(get_db))
 @app.post("/api/socratic/{session_id}/answer")
 def socratic_answer(session_id: str, request: Request, payload: SocraticAnswer, conn: sqlite3.Connection = Depends(get_db)):
     user = auth.current_user(request)
-    auth.rate_limiter.check(f"socratic:{user['id'] if user else 'local'}", 12, 60)
+    auth.rate_limiter.check(f"socratic:{user['id'] if user else 'local'}", 12, 60, settings=request.app.state.settings)
     return socratic.answer(conn, session_id, payload)
 
 
@@ -320,7 +320,7 @@ def socratic_answer(session_id: str, request: Request, payload: SocraticAnswer, 
 def socratic_generate(session_id: str, request: Request, payload: SocraticGenerate, conn: sqlite3.Connection = Depends(get_db)):
     settings: Settings = request.app.state.settings
     user = auth.current_user(request)
-    auth.rate_limiter.check(f"socratic:{user['id'] if user else 'local'}", 12, 60)
+    auth.rate_limiter.check(f"socratic:{user['id'] if user else 'local'}", 12, 60, settings=request.app.state.settings)
     return socratic.generate(conn, settings, session_id, payload)
 
 
@@ -328,7 +328,7 @@ def socratic_generate(session_id: str, request: Request, payload: SocraticGenera
 def socratic_finish(session_id: str, request: Request, payload: SocraticGenerate, conn: sqlite3.Connection = Depends(get_db)):
     settings: Settings = request.app.state.settings
     user = auth.current_user(request)
-    auth.rate_limiter.check(f"socratic:{user['id'] if user else 'local'}", 12, 60)
+    auth.rate_limiter.check(f"socratic:{user['id'] if user else 'local'}", 12, 60, settings=request.app.state.settings)
     return socratic.finish(conn, settings, session_id, payload)
 
 
