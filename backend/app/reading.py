@@ -54,6 +54,24 @@ def _add_read_range(
     )
 
 
+def _session_idempotent_replay(
+    conn: sqlite3.Connection,
+    book: dict[str, Any],
+    payload: SessionCreate,
+    request_hash: str,
+) -> dict[str, Any] | None:
+    if not payload.client_request_id:
+        return None
+    existing = conn.execute(
+        "SELECT id, edition_id, request_hash FROM reading_sessions WHERE client_request_id = ?", (payload.client_request_id,)
+    ).fetchone()
+    if not existing:
+        return None
+    if existing["edition_id"] != book["edition_id"] or existing["request_hash"] != request_hash:
+        raise HTTPException(409, "相同 client_request_id 已用于其他书籍或不同会话内容")
+    return get_session(conn, existing["id"])
+
+
 def create_session_core(
     conn: sqlite3.Connection,
     book_id: str,
@@ -62,30 +80,32 @@ def create_session_core(
 ) -> dict[str, Any]:
     book = get_book(conn, book_id)
     request_hash = hashlib.sha256(f"session:{book_id}:{payload.model_dump_json()}".encode("utf-8")).hexdigest()
-    if payload.client_request_id:
-        existing = conn.execute(
-            "SELECT id, edition_id, request_hash FROM reading_sessions WHERE client_request_id = ?", (payload.client_request_id,)
-        ).fetchone()
-        if existing:
-            if existing["edition_id"] != book["edition_id"] or existing["request_hash"] != request_hash:
-                raise HTTPException(409, "相同 client_request_id 已用于其他书籍或不同会话内容")
-            return get_session(conn, existing["id"])
+    replay = _session_idempotent_replay(conn, book, payload, request_hash)
+    if replay is not None:
+        return replay
     end = _passage(conn, payload.current_anchor, book["edition_id"])
     start = _passage(conn, payload.start_anchor, book["edition_id"]) if payload.start_anchor else None
     session_id = new_id("rs")
     now = utcnow()
     started_utc = payload.started_at.astimezone(timezone.utc).isoformat()
     ended_utc = payload.ended_at.astimezone(timezone.utc).isoformat()
-    conn.execute(
-        """INSERT INTO reading_sessions(id, user_id, edition_id, started_at, ended_at, timezone, start_anchor, current_anchor,
-                                        session_type, sequential_confirmed, anchor_read_confirmed, reading_context, client_request_id, request_hash,
-                                        source_location_attempt_id, created_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-        (session_id, LOCAL_USER, book["edition_id"], started_utc, ended_utc, payload.timezone,
-         payload.start_anchor, payload.current_anchor, payload.session_type, int(payload.sequential_confirmed),
-         int(payload.anchor_read_confirmed), (payload.reading_context or "").strip() or None, payload.client_request_id,
-         request_hash, source_location_attempt_id, now),
-    )
+    try:
+        conn.execute(
+            """INSERT INTO reading_sessions(id, user_id, edition_id, started_at, ended_at, timezone, start_anchor, current_anchor,
+                                            session_type, sequential_confirmed, anchor_read_confirmed, reading_context, client_request_id, request_hash,
+                                            source_location_attempt_id, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (session_id, LOCAL_USER, book["edition_id"], started_utc, ended_utc, payload.timezone,
+             payload.start_anchor, payload.current_anchor, payload.session_type, int(payload.sequential_confirmed),
+             int(payload.anchor_read_confirmed), (payload.reading_context or "").strip() or None, payload.client_request_id,
+             request_hash, source_location_attempt_id, now),
+        )
+    except sqlite3.IntegrityError:
+        # 另一个并发请求可能已提交相同 client_request_id；按原语义回读，而不是返回 500。
+        replay = _session_idempotent_replay(conn, book, payload, request_hash)
+        if replay is not None:
+            return replay
+        raise
     if payload.sequential_confirmed and payload.session_type == "sequential":
         _add_read_range(conn, book["edition_id"], start, end, "manual_sequential", session_id)
     elif payload.anchor_read_confirmed:
@@ -102,22 +122,34 @@ def create_session(conn: sqlite3.Connection, book_id: str, payload: SessionCreat
         return create_session_core(conn, book_id, payload)
 
 
-def list_context_photos(conn: sqlite3.Connection, session_id: str) -> list[dict[str, Any]]:
+def _context_photo_dict(row: sqlite3.Row) -> dict[str, Any]:
+    return {
+        "id": row["id"],
+        "session_id": row["session_id"],
+        "captured_at": row["captured_at"],
+        "created_at": row["created_at"],
+        "cloud_path": row["cloud_path"],
+        "url": f"/api/reading-sessions/{row['session_id']}/context-photos/{row['id']}/file" if row["local_path"] else None,
+    }
+
+
+def _context_photos_for_sessions(conn: sqlite3.Connection, session_ids: list[str]) -> dict[str, list[dict[str, Any]]]:
+    if not session_ids:
+        return {}
+    placeholders = ",".join("?" for _ in session_ids)
     rows = conn.execute(
-        "SELECT id, session_id, captured_at, created_at, local_path, cloud_path FROM reading_context_photos WHERE session_id = ? ORDER BY created_at",
-        (session_id,),
-    ).fetchall()
-    return [
-        {
-            "id": row["id"],
-            "session_id": row["session_id"],
-            "captured_at": row["captured_at"],
-            "created_at": row["created_at"],
-            "cloud_path": row["cloud_path"],
-            "url": f"/api/reading-sessions/{session_id}/context-photos/{row['id']}/file" if row["local_path"] else None,
-        }
-        for row in rows
-    ]
+        f"""SELECT id, session_id, captured_at, created_at, local_path, cloud_path
+            FROM reading_context_photos WHERE session_id IN ({placeholders}) ORDER BY created_at""",
+        session_ids,
+    )
+    result: dict[str, list[dict[str, Any]]] = {}
+    for row in rows:
+        result.setdefault(row["session_id"], []).append(_context_photo_dict(row))
+    return result
+
+
+def list_context_photos(conn: sqlite3.Connection, session_id: str) -> list[dict[str, Any]]:
+    return _context_photos_for_sessions(conn, [session_id]).get(session_id, [])
 
 
 def attach_context_photo(
@@ -189,6 +221,24 @@ def get_session(conn: sqlite3.Connection, session_id: str) -> dict[str, Any]:
     return item
 
 
+def _serialize_note(
+    note: sqlite3.Row,
+    versions: list[sqlite3.Row],
+    evidence: sqlite3.Row | None,
+    include_history: bool = True,
+) -> dict[str, Any]:
+    latest = versions[0]
+    evidence_data = dict(evidence) if evidence else None
+    if evidence_data:
+        evidence_data.pop("note_version_id", None)
+    result = dict(note)
+    result.update({"text": latest["text"], "version": latest["version"], "current_version_id": latest["id"],
+                   "source": "user", "evidence": evidence_data})
+    if include_history:
+        result["versions"] = [dict(row) for row in versions]
+    return result
+
+
 def _note_dict(conn: sqlite3.Connection, note_id: str, include_history: bool = True) -> dict[str, Any]:
     note = conn.execute(
         """SELECT n.*, COALESCE(b.title_override, w.title) AS book_title, b.id AS book_id
@@ -207,23 +257,33 @@ def _note_dict(conn: sqlite3.Connection, note_id: str, include_history: bool = T
           WHERE el.note_version_id = ? LIMIT 1""",
         (latest["id"],),
     ).fetchone()
-    result = dict(note)
-    result.update({"text": latest["text"], "version": latest["version"], "current_version_id": latest["id"],
-                   "source": "user", "evidence": dict(evidence) if evidence else None})
-    if include_history:
-        result["versions"] = [dict(row) for row in versions]
-    return result
+    return _serialize_note(note, versions, evidence, include_history)
+
+
+def _note_idempotent_replay(
+    conn: sqlite3.Connection,
+    book: dict[str, Any],
+    payload: NoteCreate,
+    request_hash: str,
+) -> dict[str, Any] | None:
+    if not payload.client_request_id:
+        return None
+    existing = conn.execute(
+        "SELECT id, edition_id, request_hash FROM notes WHERE client_request_id = ?", (payload.client_request_id,)
+    ).fetchone()
+    if not existing:
+        return None
+    if existing["edition_id"] != book["edition_id"] or existing["request_hash"] != request_hash:
+        raise HTTPException(409, "相同 client_request_id 已用于其他书籍或不同笔记内容")
+    return _note_dict(conn, existing["id"])
 
 
 def create_note(conn: sqlite3.Connection, payload: NoteCreate) -> dict[str, Any]:
     book = get_book(conn, payload.book_id)
     request_hash = hashlib.sha256(f"note:{payload.model_dump_json()}".encode("utf-8")).hexdigest()
-    if payload.client_request_id:
-        existing = conn.execute("SELECT id, edition_id, request_hash FROM notes WHERE client_request_id = ?", (payload.client_request_id,)).fetchone()
-        if existing:
-            if existing["edition_id"] != book["edition_id"] or existing["request_hash"] != request_hash:
-                raise HTTPException(409, "相同 client_request_id 已用于其他书籍或不同笔记内容")
-            return _note_dict(conn, existing["id"])
+    replay = _note_idempotent_replay(conn, book, payload, request_hash)
+    if replay is not None:
+        return replay
     if payload.session_id:
         session = conn.execute("SELECT edition_id FROM reading_sessions WHERE id = ?", (payload.session_id,)).fetchone()
         if not session or session["edition_id"] != book["edition_id"]:
@@ -234,10 +294,16 @@ def create_note(conn: sqlite3.Connection, payload: NoteCreate) -> dict[str, Any]
     version_id = new_id("nv")
     now = utcnow()
     with conn:
-        conn.execute(
-            "INSERT INTO notes(id, user_id, edition_id, session_id, author, client_request_id, request_hash, created_at, updated_at) VALUES (?, ?, ?, ?, 'user', ?, ?, ?, ?)",
-            (note_id, LOCAL_USER, book["edition_id"], payload.session_id, payload.client_request_id, request_hash, now, now),
-        )
+        try:
+            conn.execute(
+                "INSERT INTO notes(id, user_id, edition_id, session_id, author, client_request_id, request_hash, created_at, updated_at) VALUES (?, ?, ?, ?, 'user', ?, ?, ?, ?)",
+                (note_id, LOCAL_USER, book["edition_id"], payload.session_id, payload.client_request_id, request_hash, now, now),
+            )
+        except sqlite3.IntegrityError:
+            replay = _note_idempotent_replay(conn, book, payload, request_hash)
+            if replay is not None:
+                return replay
+            raise
         conn.execute("INSERT INTO note_versions(id, note_id, version, text, created_at) VALUES (?, ?, 1, ?, ?)", (version_id, note_id, payload.text, now))
         if payload.passage_id:
             conn.execute(
@@ -280,26 +346,83 @@ def update_note(conn: sqlite3.Connection, note_id: str, payload: NoteUpdate) -> 
     return result
 
 
+def _list_notes_for_edition(conn: sqlite3.Connection, edition_id: str) -> list[dict[str, Any]]:
+    notes = conn.execute(
+        """SELECT n.*, COALESCE(b.title_override, w.title) AS book_title, b.id AS book_id
+           FROM notes n JOIN editions e ON e.id = n.edition_id
+           JOIN works w ON w.id = e.work_id JOIN bookshelves b ON b.edition_id = e.id
+          WHERE n.edition_id = ? ORDER BY n.updated_at DESC""",
+        (edition_id,),
+    ).fetchall()
+    if not notes:
+        return []
+    note_ids = [row["id"] for row in notes]
+    note_placeholders = ",".join("?" for _ in note_ids)
+    versions_by_note: dict[str, list[sqlite3.Row]] = {}
+    for version in conn.execute(
+        f"SELECT * FROM note_versions WHERE note_id IN ({note_placeholders}) ORDER BY note_id, version DESC",
+        note_ids,
+    ):
+        versions_by_note.setdefault(version["note_id"], []).append(version)
+    latest_versions = {note_id: versions[0] for note_id, versions in versions_by_note.items() if versions}
+    latest_ids = [row["id"] for row in latest_versions.values()]
+    evidence_by_version: dict[str, sqlite3.Row] = {}
+    if latest_ids:
+        latest_placeholders = ",".join("?" for _ in latest_ids)
+        for evidence in conn.execute(
+            f"""SELECT p.id AS passage_id, p.chapter_title, p.position, p.start_char, p.end_char,
+                       substr(p.text, 1, 180) AS excerpt, el.note_version_id
+                  FROM evidence_links el JOIN passages p ON p.id = el.passage_id
+                 WHERE el.note_version_id IN ({latest_placeholders})""",
+            latest_ids,
+        ):
+            evidence_by_version.setdefault(evidence["note_version_id"], evidence)
+    return [
+        _serialize_note(
+            note,
+            versions_by_note[note["id"]],
+            evidence_by_version.get(latest_versions[note["id"]]["id"]),
+        )
+        for note in notes
+    ]
+
+
 def list_notes(conn: sqlite3.Connection, book_id: str) -> list[dict[str, Any]]:
     book = get_book(conn, book_id)
-    ids = conn.execute("SELECT id FROM notes WHERE edition_id = ? ORDER BY updated_at DESC", (book["edition_id"],)).fetchall()
-    return [_note_dict(conn, row["id"]) for row in ids]
+    return _list_notes_for_edition(conn, book["edition_id"])
+
+
+def _list_sessions_for_edition(conn: sqlite3.Connection, edition_id: str) -> list[dict[str, Any]]:
+    rows = conn.execute(
+        """SELECT s.*, p.chapter_title, p.position, substr(p.text, 1, 160) AS excerpt
+             FROM reading_sessions s JOIN passages p ON p.id = s.current_anchor
+            WHERE s.edition_id = ? ORDER BY s.ended_at DESC""",
+        (edition_id,),
+    ).fetchall()
+    photos = _context_photos_for_sessions(conn, [row["id"] for row in rows])
+    result = []
+    for row in rows:
+        item = dict(row)
+        item["source"] = "user"
+        item["context_photos"] = photos.get(row["id"], [])
+        result.append(item)
+    return result
 
 
 def list_sessions(conn: sqlite3.Connection, book_id: str) -> list[dict[str, Any]]:
     book = get_book(conn, book_id)
-    rows = conn.execute("SELECT id FROM reading_sessions WHERE edition_id = ? ORDER BY ended_at DESC", (book["edition_id"],))
-    return [get_session(conn, row["id"]) for row in rows]
+    return _list_sessions_for_edition(conn, book["edition_id"])
 
 
 def timeline(conn: sqlite3.Connection, book_id: str | None = None) -> list[dict[str, Any]]:
     book_ids = [book_id] if book_id else [row["id"] for row in conn.execute("SELECT id FROM bookshelves WHERE user_id = ?", (LOCAL_USER,))]
     events: list[dict[str, Any]] = []
     for current_book in book_ids:
-        for session in list_sessions(conn, current_book):
+        book = get_book(conn, current_book)
+        for session in _list_sessions_for_edition(conn, book["edition_id"]):
             events.append({"kind": "session", "occurred_at": session["ended_at"], "book_id": current_book,
-                           "book_title": get_book(conn, current_book)["title"], "source": "user", "data": session})
-        for note in list_notes(conn, current_book):
+                           "book_title": book["title"], "source": "user", "data": session})
+        for note in _list_notes_for_edition(conn, book["edition_id"]):
             events.append({"kind": "note", "occurred_at": note["updated_at"], "book_id": current_book,
                            "book_title": note["book_title"], "source": "user", "data": note})
     return sorted(events, key=lambda item: item["occurred_at"], reverse=True)
