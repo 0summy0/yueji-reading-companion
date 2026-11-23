@@ -3,6 +3,7 @@ from __future__ import annotations
 from concurrent.futures import ThreadPoolExecutor
 import os
 import sqlite3
+from types import SimpleNamespace
 
 import pytest
 from fastapi import HTTPException
@@ -44,6 +45,35 @@ def test_from_local_migration_uses_sqlite_backup_api(tmp_path, monkeypatch):
 
     with pytest.raises(SystemExit, match="拒绝覆盖"):
         migrate_local_database(settings, "旧主二", "OwnerPassword-2026")
+
+
+def test_failed_migration_rolls_back_schema_and_version_record(tmp_path, monkeypatch):
+    migrations = tmp_path / "migrations"
+    migrations.mkdir()
+    migration = migrations / "001_atomic.sql"
+    migration.write_text(
+        "CREATE TABLE partially_applied(id INTEGER PRIMARY KEY);\n"
+        "INSERT INTO missing_table VALUES (1);\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(db, "MIGRATIONS_DIR", migrations)
+    conn = db.connect_path(tmp_path / "atomic.sqlite3")
+    try:
+        with pytest.raises(sqlite3.OperationalError):
+            db.migrate(conn)
+        assert conn.execute("SELECT name FROM sqlite_master WHERE name = 'partially_applied'").fetchone() is None
+        assert conn.execute("SELECT version FROM schema_migrations").fetchall() == []
+
+        migration.write_text(
+            "CREATE TABLE partially_applied(id INTEGER PRIMARY KEY);\n"
+            "INSERT INTO partially_applied VALUES (1);\n",
+            encoding="utf-8",
+        )
+        db.migrate(conn)
+        assert conn.execute("SELECT COUNT(*) FROM partially_applied").fetchone()[0] == 1
+        assert conn.execute("SELECT version, name FROM schema_migrations").fetchone()[:] == (1, "001_atomic.sql")
+    finally:
+        conn.close()
 
 
 def test_failed_registration_does_not_consume_invite_and_concurrency_is_atomic(tmp_path, monkeypatch):
@@ -101,6 +131,42 @@ def test_forged_xff_cannot_bypass_rate_limit(review_client):
         "invite_code": "REVIEW-INVITE", "username": "伪造IP", "password": "ValidPassword-2026",
     }, headers={"X-Forwarded-For": "203.0.113.99"})
     assert forged.status_code == 429
+
+
+def test_persistent_rate_limit_is_atomic_and_shared_across_instances(tmp_path, monkeypatch):
+    monkeypatch.setenv("YUEJI_DATA_DIR", str(tmp_path / "shared-rate-limit"))
+    settings = get_settings()
+    limiter = auth.RateLimiter()
+
+    def attempt(_):
+        try:
+            limiter.check("shared-scope:user", 4, 60, settings=settings)
+            return True
+        except HTTPException as error:
+            assert error.status_code == 429
+            return False
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        results = list(pool.map(attempt, range(8)))
+    assert sum(results) == 4, "并发下只能允许配置额度内的请求"
+    with pytest.raises(HTTPException, match="过于频繁"):
+        auth.RateLimiter().check("shared-scope:user", 4, 60, settings=settings)
+
+
+def test_forwarded_ip_is_used_only_for_explicitly_trusted_proxy(tmp_path, monkeypatch):
+    monkeypatch.setenv("YUEJI_DATA_DIR", str(tmp_path / "trusted-proxy"))
+    monkeypatch.setenv("YUEJI_TRUSTED_PROXY_IPS", "127.0.0.1,10.0.0.0/8")
+    settings = get_settings()
+
+    def request_for(peer: str, forwarded: str):
+        return SimpleNamespace(
+            app=SimpleNamespace(state=SimpleNamespace(settings=settings)),
+            client=SimpleNamespace(host=peer),
+            headers={"x-forwarded-for": forwarded},
+        )
+
+    assert auth.client_key(request_for("127.0.0.1", "198.51.100.23, 10.0.0.1"), "login") == "login:198.51.100.23"
+    assert auth.client_key(request_for("192.0.2.10", "198.51.100.23"), "login") == "login:192.0.2.10"
 
 
 def test_malformed_cookies_are_invalid_not_500(review_client):

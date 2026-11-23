@@ -2,9 +2,12 @@ from __future__ import annotations
 
 import io
 import json
+import socket
 from typing import Any
 
+import httpx
 import pytest
+from fastapi import HTTPException
 from fastapi.testclient import TestClient
 from PIL import Image
 
@@ -166,3 +169,88 @@ def test_photo_accepts_cloud_signed_url_and_path(photo_book, monkeypatch):
 
     missing = client.post(f"/api/books/{book['id']}/location-attempts", data={})
     assert missing.status_code == 400
+
+
+def test_photo_unexpected_error_marks_failed_and_discards_local_file(photo_book, monkeypatch):
+    client, book, _, _ = photo_book
+    client._transport.raise_server_exceptions = False
+
+    def explode(settings, row, truth=None):
+        raise RuntimeError("模拟适配器内部异常")
+
+    monkeypatch.setattr(ai, "_provider_for_connection", explode)
+    response = client.post(
+        f"/api/books/{book['id']}/location-attempts",
+        files={"file": ("page.jpg", jpeg_bytes(), "image/jpeg")},
+    )
+    assert response.status_code == 500
+
+    from app.db import connect
+
+    with connect(client.app.state.settings) as conn:
+        row = conn.execute(
+            """SELECT la.state, p.local_path FROM location_attempts la
+               JOIN photos p ON p.id = la.photo_id ORDER BY la.created_at DESC LIMIT 1"""
+        ).fetchone()
+    assert row["state"] == "failed"
+    assert row["local_path"] is None
+    assert list(client.app.state.settings.photo_dir.rglob("*.jpg")) == []
+
+
+def test_signed_photo_rejects_unsafe_urls_and_private_dns(monkeypatch):
+    from app import photos as photos_module
+
+    monkeypatch.setattr(
+        socket,
+        "getaddrinfo",
+        lambda host, port, *args, **kwargs: [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", port))],
+    )
+    rejected = [
+        "http://cos.example.test/page.jpg?sign=xx",
+        "https://user:pass@cos.example.test/page.jpg?sign=xx",
+        "https://cos.example.test:8443/page.jpg?sign=xx",
+        "https://cos.example.test/page.jpg?sign=xx#fragment",
+        "https://127.0.0.1/page.jpg?sign=xx",
+    ]
+    for url in rejected:
+        with pytest.raises(HTTPException) as error:
+            photos_module.fetch_signed_photo(url)
+        assert error.value.status_code == 400
+
+    monkeypatch.setattr(
+        socket,
+        "getaddrinfo",
+        lambda host, port, *args, **kwargs: [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("10.0.0.8", port))],
+    )
+    with pytest.raises(HTTPException, match="非公网"):
+        photos_module.fetch_signed_photo("https://cos.example.test/page.jpg?sign=xx")
+
+
+def test_signed_photo_streams_and_limits_declared_and_actual_size(monkeypatch):
+    from app import photos as photos_module
+
+    monkeypatch.setattr(photos_module, "MAX_PHOTO_BYTES", 8)
+    monkeypatch.setattr(
+        socket,
+        "getaddrinfo",
+        lambda host, port, *args, **kwargs: [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", port))],
+    )
+    url = "https://cos.example.test/page.jpg?sign=xx"
+
+    declared = httpx.MockTransport(lambda request: httpx.Response(200, headers={"Content-Length": "9"}, content=b""))
+    with pytest.raises(HTTPException) as error:
+        photos_module.fetch_signed_photo(url, transport=declared)
+    assert error.value.status_code == 413
+
+    class ChunkedBody(httpx.SyncByteStream):
+        def __iter__(self):
+            yield b"12345"
+            yield b"67890"
+
+    chunked = httpx.MockTransport(lambda request: httpx.Response(200, stream=ChunkedBody()))
+    with pytest.raises(HTTPException) as error:
+        photos_module.fetch_signed_photo(url, transport=chunked)
+    assert error.value.status_code == 413
+
+    valid = httpx.MockTransport(lambda request: httpx.Response(200, content=b"jpeg"))
+    assert photos_module.fetch_signed_photo(url, transport=valid) == b"jpeg"
