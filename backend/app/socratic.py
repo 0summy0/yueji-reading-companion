@@ -374,19 +374,27 @@ def _validate_report(output: dict[str, Any], allowed_ids: set[str], passage_ids:
             raise HTTPException(502, "模型报告条目过多，已拒绝该报告")
 
 
+def _start_idempotent_replay(conn: sqlite3.Connection, payload: SocraticStart) -> dict[str, Any] | None:
+    if not payload.client_request_id:
+        return None
+    existing = conn.execute(
+        "SELECT * FROM socratic_sessions WHERE client_request_id = ?", (payload.client_request_id,)
+    ).fetchone()
+    if not existing:
+        return None
+    if existing["book_id"] != payload.book_id or existing["rounds_planned"] != payload.rounds:
+        raise HTTPException(409, "同一请求号已用于其他书格拉底会话，请刷新后重试")
+    view = _session_view(conn, existing)
+    view["task"] = _task_for(conn, existing)
+    view["duplicate"] = True
+    return view
+
+
 def start(conn: sqlite3.Connection, settings: Settings, payload: SocraticStart) -> dict[str, Any]:
     book = get_book(conn, payload.book_id)
-    if payload.client_request_id:
-        existing = conn.execute(
-            "SELECT * FROM socratic_sessions WHERE client_request_id = ?", (payload.client_request_id,)
-        ).fetchone()
-        if existing:
-            if existing["book_id"] != payload.book_id or existing["rounds_planned"] != payload.rounds:
-                raise HTTPException(409, "同一请求号已用于其他书格拉底会话，请刷新后重试")
-            view = _session_view(conn, existing)
-            view["task"] = _task_for(conn, existing)
-            view["duplicate"] = True
-            return view
+    replay = _start_idempotent_replay(conn, payload)
+    if replay is not None:
+        return replay
     snapshot = _snapshot(conn, payload.book_id)
     if not snapshot:
         raise HTTPException(400, "这本书还没有已读范围或笔记，书格拉底无法取证；请先记录阅读会话或写下想法")
@@ -398,13 +406,19 @@ def start(conn: sqlite3.Connection, settings: Settings, payload: SocraticStart) 
     now = utcnow()
     evidence_ids = [item["id"] for item in snapshot]
     with conn:
-        conn.execute(
-            """INSERT INTO socratic_sessions(id, user_id, book_id, edition_id, rounds_planned, engine, status, state,
-                                             evidence_ids_json, current_turn, client_request_id, created_at)
-               VALUES (?, ?, ?, ?, ?, ?, 'active', 'need_question', ?, 1, ?, ?)""",
-            (session_id, LOCAL_USER, payload.book_id, book["edition_id"], payload.rounds, payload.engine,
-             json.dumps(evidence_ids, ensure_ascii=False), payload.client_request_id, now),
-        )
+        try:
+            conn.execute(
+                """INSERT INTO socratic_sessions(id, user_id, book_id, edition_id, rounds_planned, engine, status, state,
+                                                 evidence_ids_json, current_turn, client_request_id, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?, 'active', 'need_question', ?, 1, ?, ?)""",
+                (session_id, LOCAL_USER, payload.book_id, book["edition_id"], payload.rounds, payload.engine,
+                 json.dumps(evidence_ids, ensure_ascii=False), payload.client_request_id, now),
+            )
+        except sqlite3.IntegrityError:
+            replay = _start_idempotent_replay(conn, payload)
+            if replay is not None:
+                return replay
+            raise
     session = _get_session(conn, session_id)
     view = _session_view(conn, session)
     view["task"] = _task_for(conn, session)
