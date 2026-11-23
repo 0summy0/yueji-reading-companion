@@ -40,7 +40,7 @@ py -3 scripts/install.py        # Windows 常规环境
 python3 scripts/install.py      # macOS/Linux
 ```
 
-本机没有 npm 时，用 `WORK_ENVIRONMENT.md` 中的 bundled Python/pnpm 路径执行安装脚本，并设置 `PNPM` 环境变量。根目录脚本不依赖 npm 递归调用。
+本机没有 npm 时，可显式设置 `PNPM` 环境变量后执行安装脚本；根目录脚本不依赖 npm 递归调用。后端开发安装使用 `backend/requirements.txt`，Docker 与 CI 使用已验证的 `backend/requirements-lock.txt`；根目录 `requirements.txt` 是中文产品需求文档，不是 pip 依赖清单。
 
 ### 安全默认：邀请制登录
 
@@ -123,6 +123,7 @@ docker compose exec yueji python -m app.auth_cli invite --label "同学试用"
 托管部署沿用同源形态：把本项目作为单端口 HTTP 服务发布，监听 `PORT`、绑定 `0.0.0.0`，并用环境变量注入运行参数：
 
 - `YUEJI_PUBLIC_ORIGINS=https://<你的应用域名>`——不配会让反代内部 Host 与浏览器 Origin 不一致，带 Origin 的 POST 被判跨站拒绝；
+- `YUEJI_TRUSTED_PROXY_IPS=<反代 IP 或 CIDR>`——只让可信代理传递客户端 IP，切勿配置 `0.0.0.0/0`；
 - `YUEJI_ENV=trial`、`YUEJI_AUTH_REQUIRED=true`、`YUEJI_SECURE_COOKIES=true`；
 - 首次使用先用 CLI 生成邀请码（`docker compose exec yueji python -m app.auth_cli invite --label "试用邀请"`），不要开放公开注册。
 
@@ -138,7 +139,10 @@ Cloud Service 已接入：邮箱 OTP 云端身份、书房云备份、照片直�
 - 照片在候选确认前不推进度；禁止静默切换照片服务商。
 - 问答先过滤当前用户与已读范围，再检索；模型引用不存在即拒绝展示。
 - API Key 由后端 Fernet 加密保存；响应、日志和 422 错误不回显 Key。
+- 登录注册与敏感任务限流持久化到 auth SQLite，多进程共享且重启不失效；仅对可信代理解析 `X-Forwarded-For`。
 - 自定义模型端点只允许管理员配置的主机清单，校验 HTTPS、443、DNS 公网地址，禁止重定向。
+- 云端签名照片 URL 只允许公网 HTTPS 域名，禁止重定向；流式下载同时限制声明大小与实际累计字节。
+- 数据库迁移按版本整体事务提交；失败时表结构和版本记录一并回滚，修复后可重试。
 
 ## 8. 目录速查
 
@@ -149,8 +153,10 @@ Cloud Service 已接入：邮箱 OTP 云端身份、书房云备份、照片直�
 - `frontend/src/cloud/cloudService.ts`：Auth/Database/Storage/LLM 四模块封装。
 - `backend/app/asking.py`：已读证据过滤与真实问答。
 - `backend/app/auth.py`、`auth_cli.py`：邀请制账号、会话、本地数据迁移。
-- `backend/migrations/003*.sql`、`004*.sql`：照片确认关联和阅读情境等迁移。
+- `backend/migrations/`：按版本原子执行的 SQLite 结构迁移与查询索引。
+- `backend/requirements-lock.txt`：Docker 与 CI 使用的已验证 Python 依赖锁定清单。
 - `frontend/src/components/Settings.tsx`：DeepSeek/BYOK 设置与三项检测。
 - `frontend/src/components/Journal.tsx`：手账、阅读情境、照片候选确认。
 - `frontend/src/components/AskPage.tsx`：证据式问答。
 - `Dockerfile`、`docker-compose.yml`：通用部署方案。
+- `.github/workflows/ci.yml`：每次 main 推送和 PR 自动运行后端测试、前端测试、生产构建与 Docker 镜像构建。
